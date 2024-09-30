@@ -9,10 +9,10 @@ data_stages:
 - data:
     dataset:
       dataset_folder:
-      - datasets/fineweb-edu-dedup
-      - datasets/cosmopedia-v2
-      - datasets/python-edu
-      - datasets/open-web-math
+        datasets/fineweb-edu-dedup: 0.88
+        datasets/cosmopedia-v2: 0.1
+        datasets/python-edu: 0.01
+        datasets/open-web-math: 0.01
     num_loading_workers: 0
     seed: 8
   name: training stage
