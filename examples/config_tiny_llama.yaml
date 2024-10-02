@@ -68,6 +68,7 @@ model:
     use_cache: true
     vocab_size: 256
 optimizer:
+  accumulate_grad_in_fp32: false
   clip_grad: 1.0
   learning_rate_scheduler:
     learning_rate: 0.0003
