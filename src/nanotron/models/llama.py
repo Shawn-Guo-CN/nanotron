@@ -1005,7 +1005,11 @@ class Loss(nn.Module):
                 # average loss over domains
                 avg_domain_losses = domain_losses / domain_token_counts
 
-                result.update({"domain_loss": avg_domain_losses})
+        # to satisify the output_keys check from PipelineBlock
+        if domain_ids is not None:
+            result.update({"domain_loss": avg_domain_losses})
+        else:
+            result.update({"domain_loss": -1 * torch.ones(self._num_domains, device='cuda', dtype=torch.float32)})
 
         return result
 
@@ -1028,8 +1032,9 @@ class LlamaForTraining(NanotronModel):
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
+                "domain_ids",
             },
-            module_output_keys={"loss"},
+            module_output_keys={"loss", "domain_loss"},
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -1041,17 +1046,19 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        domain_ids: Optional[torch.Tensor] = None, # [batch_size]
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
         )
-        loss = self.loss(
+        metrics = self.loss(
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
-        )["loss"]
-        return {"loss": loss}
+            domain_ids=domain_ids,
+        )
+        return metrics
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
