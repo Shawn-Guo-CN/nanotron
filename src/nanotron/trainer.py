@@ -452,7 +452,7 @@ class DistributedTrainer:
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
                 # Training step
-                outputs, loss_avg = self.training_step(dataloader=self.current_dataloader)
+                outputs, loss_avg, domain_loss_avg = self.training_step(dataloader=self.current_dataloader)
 
                 # Training Logs
                 # TODO(xrsrke): refactor using callbacks would be better
@@ -462,6 +462,7 @@ class DistributedTrainer:
                     self.metadata.last_stage_idx
                 ].consumed_train_samples += self.global_batch_size
 
+                # TODO (sguo): add domain_loss_avg in to the train_step_logs
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
                     self.train_step_logs(outputs=outputs, loss_avg=loss_avg)
 
@@ -486,6 +487,7 @@ class DistributedTrainer:
         if self.iteration_step < self.initial_iter_step + 5:
             log_memory(logger=logger)
 
+        # NOTE: outputs below is now a list of dictionary with keys "loss" and "domain_loss"
         outputs = self.pipeline_engine.train_batch_iter(
             model=self.model,
             pg=self.parallel_context.pp_pg,
@@ -552,6 +554,18 @@ class DistributedTrainer:
             loss_avg = None
             handle = None
 
+        # Compute DP average domain loss
+        if isinstance(outputs[0]["domain_loss"], torch.Tensor):
+            # This is an average on only one data rank.
+            domain_loss_avg = torch.stack([output["domain_loss"] for output in outputs]).mean(dim=0) 
+            # sync domain loss across DP
+            domain_handle = dist.all_reduce(
+                domain_loss_avg, group=self.parallel_context.dp_pg, async_op=True, op=dist.ReduceOp.SUM
+            )
+        else:
+            domain_loss_avg = None
+            handle = None
+
         # Move optimizer states back to GPU before optimizer step
         if (
             self.init_checkpoint_path is not None
@@ -576,9 +590,13 @@ class DistributedTrainer:
         if handle is not None:
             handle.wait()
 
+        if domain_handle is not None:
+            domain_handle.wait()
+            domain_loss_avg.div_(self.config.parallelism.dp)
+
         self.post_train_step()
 
-        return outputs, loss_avg
+        return outputs, loss_avg, domain_loss_avg
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
         outputs = self.pipeline_engine.validate_batch_iter(
