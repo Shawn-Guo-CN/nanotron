@@ -126,6 +126,11 @@ def get_datasets(
     return raw_datasets
 
 
+def _add_id_column_to_dataset(ds: "DatasetDict", id: int, split: str = 'train') -> "DatasetDict":
+    id_column = [id] * len(ds)
+    return ds.add_column("domain_id", id_column)
+
+
 # Adapted from h4/src/h4/data/loading.py
 def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "DatasetDict":
     """
@@ -165,14 +170,18 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
 
     if len(raw_train_datasets) > 0:
         train_subsets = []
-        for dataset, frac in zip(raw_train_datasets, fracs):
+        for idx, (dataset, frac) in enumerate(zip(raw_train_datasets, fracs)):
             train_subset = dataset.select(range(int(frac * len(dataset))))
+            train_subset = _add_id_column_to_dataset(train_subset, idx)
             train_subsets.append(train_subset)
         raw_datasets["train"] = concatenate_datasets(train_subsets).shuffle(seed=seed)
 
     # No subsampling for test datasets to enable fair comparison across models
     if len(raw_test_datasets) > 0:
-        raw_datasets["test"] = concatenate_datasets(raw_test_datasets).shuffle(seed=seed)
+        test_sets = []
+        for idx, raw_test_dataset in enumerate(raw_test_datasets):
+            test_sets.append(_add_id_column_to_dataset(raw_test_dataset, idx))
+        raw_datasets["test"] = concatenate_datasets(test_sets).shuffle(seed=seed)
 
     if len(raw_datasets) == 0:
         raise ValueError(
@@ -285,6 +294,7 @@ def clm_process(
     dataset_processing_num_proc_per_process: int,
     dataset_overwrite_cache: bool,
     sequence_length: int,
+    return_domain_ids: bool = False,
 ):
     """Concatenate all texts from raw_dataset and generate chunks of `sequence_length + 1`, where chunks overlap by a single token."""
     # Adapted from https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/examples/pytorch/language-modeling/run_clm.py#L391-L439
@@ -310,6 +320,10 @@ def clm_process(
         tokenized_batch = tokenizer.batch_encode_plus(texts, return_attention_mask=False, return_token_type_ids=False)
         tokenized_batch = {k: [np.array(tokenized_texts) for tokenized_texts in v] for k, v in tokenized_batch.items()}
         return group_texts(tokenized_batch)
+
+    # TODO (sguo): the domain ids should be constructed here, some useful tips are given below
+    # 1. obtain the name of raw_dataset: raw_dataset.info.dataset_name
+    # 2. need a mapping between ids and names
 
     train_dataset = raw_dataset.map(
         _tokenize_and_group_texts,
