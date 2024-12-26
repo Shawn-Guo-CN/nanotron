@@ -21,6 +21,7 @@ from nanotron.sanity_checks import (
 try:
     import datasets
     from datasets import (
+        ClassLabel,
         Dataset,
         DatasetDict,
         Features,
@@ -109,7 +110,7 @@ def get_datasets(
         #     - 'dataset1': 0.5
         #     - 'dataset2': 0.3
         #     - 'dataset3': 0.2
-        raw_datasets = _get_dataset_mix(hf_dataset_or_datasets, splits=splits)
+        raw_datasets, domain_name2id = _get_dataset_mix(hf_dataset_or_datasets, splits=splits)
     elif isinstance(hf_dataset_or_datasets, str):
         # e.g. Dataset = "HuggingFaceH4/testing_alpaca_small"
         # Note this returns things other than just train/test, which may not be intended
@@ -120,10 +121,11 @@ def get_datasets(
                 hf_dataset_config_name,
                 split=split,
             )
+        domain_name2id = {hf_dataset_or_datasets: 0}
     else:
         raise ValueError(f"hf_dataset_or_datasets must be a dict or string but is {type(hf_dataset_or_datasets)}")
 
-    return raw_datasets
+    return raw_datasets, domain_name2id
 
 
 def _add_id_column_to_dataset(ds: "DatasetDict", id: int, split: str = 'train') -> "DatasetDict":
@@ -132,7 +134,7 @@ def _add_id_column_to_dataset(ds: "DatasetDict", id: int, split: str = 'train') 
 
 
 # Adapted from h4/src/h4/data/loading.py
-def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "DatasetDict":
+def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed: int = 42) -> "DatasetDict":
     """
     Helper function to load dataset mix from dict configuration.
 
@@ -145,6 +147,8 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
     raw_train_datasets = []
     raw_test_datasets = []
     fracs = []
+    domain_name2id = {}
+
     for ds, frac in dataset_dict.items():
         if frac < 0:
             raise ValueError(f"Dataset fraction for dataset {ds} is negative. (= {frac})")
@@ -171,24 +175,26 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
     if len(raw_train_datasets) > 0:
         train_subsets = []
         for idx, (dataset, frac) in enumerate(zip(raw_train_datasets, fracs)):
+            domain_name2id[dataset.info.dataset_name] = idx
             train_subset = dataset.select(range(int(frac * len(dataset))))
             train_subset = _add_id_column_to_dataset(train_subset, idx)
             train_subsets.append(train_subset)
-        raw_datasets["train"] = concatenate_datasets(train_subsets).shuffle(seed=seed)
+        raw_datasets["train"] = concatenate_datasets(train_subsets)
+        # we remove the shuffle here to avoid the complexity of adding domain ids
 
     # No subsampling for test datasets to enable fair comparison across models
     if len(raw_test_datasets) > 0:
         test_sets = []
         for idx, raw_test_dataset in enumerate(raw_test_datasets):
             test_sets.append(_add_id_column_to_dataset(raw_test_dataset, idx))
-        raw_datasets["test"] = concatenate_datasets(test_sets).shuffle(seed=seed)
+        raw_datasets["test"] = concatenate_datasets(test_sets)
 
     if len(raw_datasets) == 0:
         raise ValueError(
             f"Dataset {dataset_dict} not recognized with split {split}. Check the dataset has been correctly formatted."
         )
 
-    return raw_datasets
+    return raw_datasets, domain_name2id
 
 
 def dummy_infinite_data_generator(
@@ -295,47 +301,81 @@ def clm_process(
     dataset_overwrite_cache: bool,
     sequence_length: int,
     return_domain_ids: bool = False,
+    domain_id_column_name: str = 'domain_id',
+    domain_name_to_id: Dict[str, int] | None = None,
+    seed: int = 42,
 ):
     """Concatenate all texts from raw_dataset and generate chunks of `sequence_length + 1`, where chunks overlap by a single token."""
     # Adapted from https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/examples/pytorch/language-modeling/run_clm.py#L391-L439
 
-    def group_texts(examples: Dict[str, List[np.ndarray]]) -> Dict[str, List[np.ndarray]]:
-        # Concatenate all texts.
-        concatenated_examples = {k: np.concatenate(v) for k, v in examples.items()}
-        total_length = len(concatenated_examples[next(iter(examples.keys()))])
-        # WARNING: We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
-        # customize this part to your needs.
-        if total_length >= sequence_length + 1:
-            total_length = ((total_length - 1) // sequence_length) * sequence_length + 1
-        # Split by chunks of sequence_length.
-        result = {
-            k: [
-                t[i : i + sequence_length + 1] for i in range(0, total_length - (sequence_length + 1), sequence_length)
-            ]
-            for k, t in concatenated_examples.items()
-        }
+    if return_domain_ids:
+        assert domain_id_column_name in raw_dataset.column_names, """
+            "domain_id" should be one of the columns names when "return_domain_ids" is True
+        """
+        assert domain_name_to_id is not None, """
+            "domain_name_to_id" should be set if "return_domain_ids" is True
+        """
+
+    def group_texts(examples: Dict[str, List[np.ndarray]], domain_ids: List[int]
+    ) -> Dict[str, Union[List[np.ndarray], int]]:
+        for v in examples.values():
+            assert len(v) == len(domain_ids), """
+             The number of elements in "exampls" should be the same to size of "domain_ids"
+            """
+
+        # map domains to examples
+        domain_to_examples = {}
+        for i, domain_id in enumerate(domain_ids):
+            if domain_id not in domain_to_examples:
+                domain_to_examples[domain_id] = {k: [] for k in examples.keys()}
+            for k in examples.keys():
+                domain_to_examples[domain_id][k].append(examples[k][i])
+
+        # concatenate all texts by domains
+        result = {k: [] for k in examples.keys()}
+        result['domain_id'] = []
+
+        for domain_id, domain_data in domain_to_examples.items():
+            concatenated = {k: np.concatenate(v) for k, v in domain_data.items()}
+            total_length = len(concatenated[next(iter(examples.keys()))])
+            # WARNING: We drop the small remainder, we could add padding if the model supported it instead of this 
+            # drop, you can customize this part to your needs.
+            if total_length >= sequence_length + 1:
+                total_length = ((total_length - 1) // sequence_length) * sequence_length + 1
+
+            for k in examples.keys():
+                # split to chunks
+                chunks = [
+                    concatenated[k][i:i+sequence_length+1]
+                    for i in range(0, total_length - (sequence_length + 1), sequence_length)
+                ]
+                result[k].extend(chunks)
+            result['domain_id'].extend([domain_id] * len(chunks))
+
         return result
 
-    def _tokenize_and_group_texts(texts: List[str]) -> Dict[str, List[np.ndarray]]:
+    def _tokenize_and_group_texts_and_ids(texts: List[str], domain_ids: List[int]) -> Dict[str, List[np.ndarray]]:
         tokenized_batch = tokenizer.batch_encode_plus(texts, return_attention_mask=False, return_token_type_ids=False)
         tokenized_batch = {k: [np.array(tokenized_texts) for tokenized_texts in v] for k, v in tokenized_batch.items()}
-        return group_texts(tokenized_batch)
+        return group_texts(tokenized_batch, domain_ids)
 
-    # TODO (sguo): the domain ids should be constructed here, some useful tips are given below
-    # 1. obtain the name of raw_dataset: raw_dataset.info.dataset_name
-    # 2. need a mapping between ids and names
+    _input_columns = text_column_name if not return_domain_ids else [text_column_name, domain_id_column_name]
 
     train_dataset = raw_dataset.map(
-        _tokenize_and_group_texts,
-        input_columns=text_column_name,
+        _tokenize_and_group_texts_and_ids,
+        input_columns=_input_columns,
         remove_columns=raw_dataset.column_names,
-        features=Features({"input_ids": Sequence(feature=Value(dtype="int64"), length=sequence_length + 1)}),
+        features=Features({
+            "input_ids": Sequence(feature=Value(dtype="int64"), length=sequence_length + 1),
+            "domain_id": ClassLabel(num_classes=len(domain_name_to_id), names= list(domain_name_to_id.keys()))
+        }),
         batched=True,
         num_proc=dataset_processing_num_proc_per_process,
         load_from_cache_file=not dataset_overwrite_cache,
         desc=f"Grouping texts in chunks of {sequence_length+1}",
     )
-    return train_dataset
+
+    return train_dataset.shuffle(seed=seed)
 
 
 # Adapted from: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/data/data_collator.py#L607
