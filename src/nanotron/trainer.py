@@ -259,6 +259,10 @@ class DistributedTrainer:
 
         self.post_init()
 
+    def set_domain_name_id_mappings(self, name2id: Dict[str, int]) -> None:
+        self.domain_name2id = name2id
+        self.domain_id2name = {v: k for k, v in name2id.items()}
+
     def pre_init(self):
         self.init_checkpoint_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
 
@@ -624,6 +628,10 @@ class DistributedTrainer:
             global_batch_size=self.global_batch_size,
         )
 
+        assert self.domain_id2name is not None and self.domain_name2id is not None, """
+            call `set_domain_name2id` before the training steps
+        """
+
         # TODO (sguo): log the input domain_loss_avg
         if dist.get_rank(self.parallel_context.world_pg) in self.logger_ranks:
             assert self.loggerwriter is not None, "loggerwriter should be defined on logger ranks"
@@ -648,6 +656,9 @@ class DistributedTrainer:
                 LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
                 LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
             ]
+
+            for idx, name in self.domain_id2name.items():
+                log_entries.append(LogItem(f"loss_on_{name}", domain_loss_avg[idx].item(), "human_format"))
 
             if self.config.optimizer.clip_grad is not None:
                 log_entries.append(LogItem("grad_norm", self.grad_norm_unclipped.item(), "human_format"))  # , ".3f"))

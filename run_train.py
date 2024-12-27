@@ -96,6 +96,7 @@ def get_dataloader_from_data_stage(
                 splits=data.dataset.hf_dataset_splits,
             )
             raw_dataset = raw_dataset["train"]
+            trainer.set_domain_name_id_mappings(domain_name2id)
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             tokenizer.pad_token = tokenizer.eos_token
@@ -117,8 +118,6 @@ def get_dataloader_from_data_stage(
                 return_domain_ids=True,
                 domain_name_to_id=domain_name2id,
             )
-
-            # TODO (sguo): update the following part to include 'domain_id' column of train_dataset
 
             # We load the processed dataset on the ranks requiring it
             dataloader = get_train_dataloader(
