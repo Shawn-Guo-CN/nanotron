@@ -955,15 +955,20 @@ def masked_mean(loss, label_mask, dtype):
 
 
 class Loss(nn.Module):
+    # Reference: https://github.com/MaxiBoether/nanotron-streaming/blob/214ba79da9fa098f3e141e9a88d1f97f585a4f19/src/nanotron/models/llama.py#L957
     def __init__(self, tp_pg: dist.ProcessGroup):
         super().__init__()
         self.tp_pg = tp_pg
+        # Below are added for domain-wise losses
+        self._num_domains = 64 # TODO (sguo): check if 64 is large enough
+        self.has_per_domain_loss = False
 
     def forward(
         self,
         sharded_logits: torch.Tensor,  # [seq_length, batch_size, logits]
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
+        domain_ids: Optional[torch.Tensor] = None, # [batch_size]
     ) -> Dict[str, torch.Tensor]:
         # Megatron by defaults cast everything in fp32. `--f16-lm-cross-entropy` is an option you can use to keep current precision.
         # https://github.com/NVIDIA/Megatron-LM/blob/f267e6186eae1d6e2055b412b00e2e545a8e896a/megatron/model/gpt_model.py#L38
@@ -972,10 +977,41 @@ class Loss(nn.Module):
             sharded_logits, label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float
         ).transpose(0, 1)
         # TODO @thomasw21: It's unclear what kind of normalization we want to do.
-        loss = masked_mean(loss, label_mask, dtype=torch.float)
+        avg_loss = masked_mean(loss, label_mask, dtype=torch.float)
         # I think indexing causes a sync we don't actually want
         # loss = loss[label_mask].sum()
-        return {"loss": loss}
+        result = {"loss": avg_loss}
+
+        # Begin of calculating domain-wise loss
+        if domain_ids is not None:
+            with torch.no_grad():
+                self.has_per_domain_loss = True
+                domain_ids = domain_ids.unsqueeze(-1).expand(-1, loss.size(1))  # [bs, seq_len]
+                masked_loss = loss * label_mask
+
+                # TODO (sguo): check if the domain_losses below is correct
+                # for each domain, get the overall loss
+                domain_losses = torch.zeros(self._num_domains, device='cuda', dtype=torch.float32)
+                domain_losses.scatter_add_(0, domain_ids.reshape(-1), masked_loss.reshape(-1))
+
+                 # for each domain, count the number of valid tokens
+                domain_token_counts = torch.zeros_like(domain_losses)
+                for domain_id in torch.unique(domain_ids):
+                   domain_mask = (domain_ids == domain_id)
+                   num_valid_tokens = (label_mask & domain_mask).sum()
+                   domain_token_counts[domain_id] = num_valid_tokens
+                domain_token_counts = torch.clamp(domain_token_counts, min=1) # to avoid underflow
+
+                # average loss over domains
+                avg_domain_losses = domain_losses / domain_token_counts
+
+        # to satisify the output_keys check from PipelineBlock
+        if domain_ids is not None:
+            result.update({"domain_loss": avg_domain_losses})
+        else:
+            result.update({"domain_loss": -1 * torch.ones(self._num_domains, device='cuda', dtype=torch.float32)})
+
+        return result
 
 
 class LlamaForTraining(NanotronModel):
@@ -996,8 +1032,9 @@ class LlamaForTraining(NanotronModel):
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
+                "domain_ids",
             },
-            module_output_keys={"loss"},
+            module_output_keys={"loss", "domain_loss"},
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -1009,17 +1046,19 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
+        domain_id: Optional[torch.Tensor] = None, # (batch_size,)
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
         )
-        loss = self.loss(
+        metrics = self.loss(
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
-        )["loss"]
-        return {"loss": loss}
+            domain_ids=domain_id,
+        )
+        return metrics
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):

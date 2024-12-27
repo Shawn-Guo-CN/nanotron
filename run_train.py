@@ -90,11 +90,13 @@ def get_dataloader_from_data_stage(
             # TODO: generalise to include  for validation/test splits
 
             # We load the raw dataset
-            raw_dataset = get_datasets(
+            raw_dataset, domain_name2id = get_datasets(
                 hf_dataset_or_datasets=data.dataset.hf_dataset_or_datasets,
                 hf_dataset_config_name=data.dataset.hf_dataset_config_name,
                 splits=data.dataset.hf_dataset_splits,
-            )["train"]
+            )
+            raw_dataset = raw_dataset["train"]
+            trainer.set_domain_name_id_mappings(domain_name2id)
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             tokenizer.pad_token = tokenizer.eos_token
@@ -113,6 +115,8 @@ def get_dataloader_from_data_stage(
                 dataset_processing_num_proc_per_process=data.dataset.dataset_processing_num_proc_per_process,
                 dataset_overwrite_cache=data.dataset.dataset_overwrite_cache,
                 sequence_length=trainer.sequence_length,
+                return_domain_ids=True,
+                domain_name_to_id=domain_name2id,
             )
 
             # We load the processed dataset on the ranks requiring it
@@ -128,6 +132,7 @@ def get_dataloader_from_data_stage(
                 seed_worker=data.seed,
                 dataloader_drop_last=True,
             )
+
 
             # Check if we have enough samples for train_steps
             total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
