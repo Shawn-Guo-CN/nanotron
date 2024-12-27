@@ -121,6 +121,7 @@ def get_datasets(
                 hf_dataset_config_name,
                 split=split,
             )
+            raw_datasets[split] = _add_id_column_to_dataset(raw_datasets[split], 0)
         domain_name2id = {hf_dataset_or_datasets: 0}
     else:
         raise ValueError(f"hf_dataset_or_datasets must be a dict or string but is {type(hf_dataset_or_datasets)}")
@@ -310,10 +311,10 @@ def clm_process(
 
     if return_domain_ids:
         assert domain_id_column_name in raw_dataset.column_names, """
-            "domain_id" should be one of the columns names when "return_domain_ids" is True
+            `domain_id` should be one of the columns names when "return_domain_ids" is True
         """
         assert domain_name_to_id is not None, """
-            "domain_name_to_id" should be set if "return_domain_ids" is True
+            `domain_name_to_id` should be set if "return_domain_ids" is True
         """
 
     def group_texts(examples: Dict[str, List[np.ndarray]], domain_ids: List[int]
@@ -407,14 +408,16 @@ class DataCollatorForCLM:
                 "input_mask": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
+                "domain_id": TensorPointer(group_rank=self.output_pp_rank),
             }
 
         # Make sure we load only what's necessary, ie we only load a `input_ids` column.
-        assert all(list(example.keys()) == ["input_ids"] for example in examples)
+        assert all(list(example.keys()) == ["input_ids", "domain_id"] for example in examples)
 
         # TODO @nouamanetazi: Is it better to have examples as np.array or torch.Tensor?
         input_ids = np.vstack([examples[i]["input_ids"] for i in range(len(examples))])  # (b, s)
         batch_size, expanded_input_length = input_ids.shape
+        domain_ids = np.array([examples[i]["domain_id"] for i in range(len(examples))])
 
         result: Dict[str, Union[np.ndarray, TensorPointer]] = {}
 
@@ -422,6 +425,7 @@ class DataCollatorForCLM:
         result["input_mask"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
+        result["domain_id"] = TensorPointer(group_rank=self.output_pp_rank)
 
         assert (
             expanded_input_length == self.sequence_length + 1
@@ -436,6 +440,7 @@ class DataCollatorForCLM:
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
             result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
+            result["domain_id"] = domain_ids
 
         if isinstance(result["input_ids"], torch.Tensor) and result["input_ids"].shape[-1] != self.sequence_length:
             raise ValueError(
@@ -515,21 +520,24 @@ def get_train_dataloader(
         input_pp_rank,
         output_pp_rank,
     ]:
-        train_dataset = train_dataset.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
+        train_dataset = train_dataset.with_format(
+            type="numpy", columns=["input_ids", "domain_id"], output_all_columns=True
+        )
 
     # Case of ranks not requiring data. We give them an infinite dummy dataloader
     else:
         #
-        assert train_dataset.column_names == ["input_ids"], (
-            f"Dataset has to have a single column, with `input_ids` as the column name. "
+        assert train_dataset.column_names == ["input_ids", "domain_id"], (
+            f"Dataset has to have two columns, with `input_ids` and `domain_id` as the column names. "
             f"Current dataset: {train_dataset}"
         )
         dataset_length = len(train_dataset)
-        train_dataset = train_dataset.remove_columns(column_names="input_ids")
+        train_dataset = train_dataset.remove_columns(column_names=["input_ids", "domain_id"])
         assert (
             len(train_dataset) == 0
         ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {train_dataset}"
-        # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
+        # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes 
+        # empty.
         train_dataset = EmptyInfiniteDataset(length=dataset_length)
         # No need to spawn a lot of workers, we can just use main
         dataloader_num_workers = 0

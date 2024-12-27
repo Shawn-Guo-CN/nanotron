@@ -1046,7 +1046,7 @@ class LlamaForTraining(NanotronModel):
         input_mask: Union[torch.Tensor, TensorPointer],
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
-        domain_ids: Optional[torch.Tensor] = None, # [batch_size]
+        domain_id: Optional[torch.Tensor] = None, # (batch_size,)
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         sharded_logits = self.model(
             input_ids=input_ids,
@@ -1056,7 +1056,7 @@ class LlamaForTraining(NanotronModel):
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
-            domain_ids=domain_ids,
+            domain_ids=domain_id,
         )
         return metrics
 
